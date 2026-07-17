@@ -164,6 +164,7 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
 
     // OMT Network Streaming
     private OMTStreamingManager omtStreamingManager; // may be null - created when enabled in settings
+    private boolean omtKeptCameraOnPause = false; // true if onPause() kept the camera open for background OMT streaming
 
     // private boolean ui_placement_right = true;
 
@@ -1449,6 +1450,14 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
         // want to wait until images are saved,
         waitUntilImageQueueEmpty();
 
+        // Shut down OMT streaming: the camera closes with the activity, so
+        // the sender and foreground service must not outlive it.
+        if (omtStreamingManager != null) {
+            omtStreamingManager.stopAll();
+            omtStreamingManager = null;
+        }
+        OMTStreamingService.stop(this);
+
         preview.onDestroy();
         if (applicationInterface != null) {
             applicationInterface.onDestroy();
@@ -1810,7 +1819,13 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
 
         applicationInterface.reset(false); // should be called before opening the camera in preview.onResume()
 
-        if (!camera_in_background) {
+        if (omtKeptCameraOnPause) {
+            // Camera was never closed in onPause (OMT streaming continued in
+            // background) - don't reopen it.
+            if (MyDebug.LOG)
+                Log.d(TAG, "onResume: camera was kept open for OMT streaming");
+            omtKeptCameraOnPause = false;
+        } else if (!camera_in_background) {
             // don't restart camera if we're showing a dialog or settings
             preview.onResume();
         }
@@ -1933,11 +1948,22 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
         applicationInterface.clearLastImages(); // this should happen when pausing the preview, but call explicitly just
                                                 // to be safe
         applicationInterface.getDrawPreview().clearGhostImage();
-        preview.onPause();
-        applicationInterface.getDrawPreview().setCoverPreview(true); // must be after we've closed the preview
-                                                                     // (otherwise risk that further frames from preview
-                                                                     // will unset the cover_preview flag in
-                                                                     // DrawPreview)
+        if (isOmtStreaming()) {
+            // Keep the camera and OMT output running while the screen is off /
+            // app is in background. The camera-type foreground service
+            // (OMTStreamingService) permits background camera use, and
+            // OMTStreamingManager's wake/wifi locks keep CPU and network up.
+            if (MyDebug.LOG)
+                Log.d(TAG, "onPause: OMT streaming active, keeping camera open");
+            omtKeptCameraOnPause = true;
+        } else {
+            preview.onPause();
+            applicationInterface.getDrawPreview().setCoverPreview(true); // must be after we've closed the preview
+                                                                         // (otherwise risk that further frames from
+                                                                         // preview
+                                                                         // will unset the cover_preview flag in
+                                                                         // DrawPreview)
+        }
 
         if (applicationInterface.getImageSaver().getNImagesToSave() > 0) {
             createImageSavingNotification();
@@ -2361,6 +2387,36 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
             preview.showToast(null, R.string.omt_streaming_failed, true);
         } else if (omtStreamingManager != null) {
             preview.setOmtStreamingSurface(omtStreamingManager.getStreamingSurface());
+
+            // Foreground service (camera type) so streaming survives screen off.
+            // Must be started while the app is still in the foreground.
+            OMTStreamingService.start(this);
+
+            requestOmtBatteryOptimizationExemption();
+        }
+    }
+
+    /**
+     * Ask the user (once) to exempt the app from battery optimization, so Doze
+     * doesn't suspend networking during long screen-off streaming sessions.
+     */
+    private void requestOmtBatteryOptimizationExemption() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M)
+            return;
+        android.os.PowerManager powerManager = (android.os.PowerManager) getSystemService(POWER_SERVICE);
+        if (powerManager == null || powerManager.isIgnoringBatteryOptimizations(getPackageName()))
+            return;
+        SharedPreferences sharedPreferences = PreferenceManager.getDefaultSharedPreferences(this);
+        final String doneKey = "done_omt_battery_optimization_prompt";
+        if (sharedPreferences.getBoolean(doneKey, false))
+            return;
+        sharedPreferences.edit().putBoolean(doneKey, true).apply();
+        try {
+            Intent intent = new Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:" + getPackageName()));
+            startActivity(intent);
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to request battery optimization exemption", e);
         }
     }
 
@@ -2378,6 +2434,10 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
             omtStreamingManager.stopStreaming();
             // Don't set to null - keep announcement active
         }
+
+        // No longer streaming - background continuation not needed
+        OMTStreamingService.stop(this);
+
         updateOmtStreamingUI(false);
     }
 
