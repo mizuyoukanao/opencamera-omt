@@ -99,7 +99,10 @@ public:
     
     // Statistics
     ChannelStats getStats() const;
-    
+
+    // Frames dropped since the last call (for periodic monitoring)
+    int64_t getAndResetRecentDrops() { return recentDropped_.exchange(0); }
+
     // Endpoint info
     std::string getRemoteAddress() const;
     int getRemotePort() const;
@@ -115,6 +118,7 @@ private:
     std::unique_ptr<AsyncPool> sendPool_;
     std::queue<AsyncBuffer*> pendingQueue_;
     std::mutex queueMutex_;
+    std::mutex sendMutex_;  // serializes all socket writes (video + metadata)
     std::condition_variable queueCV_;
     std::thread senderThread_;
     std::thread receiverThread_;
@@ -129,6 +133,7 @@ private:
     // Statistics
     std::atomic<int64_t> framesSent_{0};
     std::atomic<int64_t> framesDropped_{0};
+    std::atomic<int64_t> recentDropped_{0};
     std::atomic<int64_t> bytesSent_{0};
     std::atomic<int64_t> bytesReceived_{0};
     

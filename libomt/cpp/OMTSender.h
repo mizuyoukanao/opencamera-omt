@@ -121,6 +121,11 @@ public:
      * Get aggregated statistics
      */
     SenderStats getStats();
+
+    /**
+     * Frames dropped across all channels since the last call.
+     */
+    int64_t getAndResetRecentDrops();
     
     /**
      * Get the best suggested quality from all clients
@@ -172,6 +177,10 @@ private:
     // Statistics
     std::atomic<int64_t> totalEncodedBytes_{0};
     std::atomic<int> frameCount_{0};
+
+    // Congestion window snapshots (accessed from send() thread only)
+    int64_t lastCongestionSent_ = 0;
+    int64_t lastCongestionDropped_ = 0;
     
     // Callbacks
     ConnectionCallback onConnect_;

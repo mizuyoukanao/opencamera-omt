@@ -27,11 +27,17 @@ namespace omt {
 Channel::Channel(int socketFd, struct sockaddr_in address, 
                  int sendBufferSize, IChannelListener* listener)
     : socketFd_(socketFd), address_(address), listener_(listener) {
-    
-    // Set non-blocking for recv
-    int flags = fcntl(socketFd_, F_GETFL, 0);
-    fcntl(socketFd_, F_SETFL, flags | O_NONBLOCK);
-    
+
+    // Socket stays in blocking mode: recv is guarded by select() in
+    // receiverLoop, and sends are bounded by SO_SNDTIMEO below. Toggling
+    // O_NONBLOCK per call raced between sender/receiver threads.
+
+    // Bound blocking sends so a stalled receiver is detected and dropped
+    // instead of freezing the sender thread for the TCP retransmission
+    // timeout (many minutes).
+    struct timeval sndTimeout{5, 0};
+    setsockopt(socketFd_, SOL_SOCKET, SO_SNDTIMEO, &sndTimeout, sizeof(sndTimeout));
+
     // TCP_NODELAY for low latency
     int one = 1;
     setsockopt(socketFd_, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
@@ -140,33 +146,25 @@ ChannelStats Channel::getStats() const {
 
 bool Channel::sendMetadataSync(const char* xml) {
     if (!connected_) return false;
-    
+
     int len = strlen(xml);
     int totalLen = len + 1;
-    
+
     FrameHeader header{};
     header.version = 1;
     header.frameType = static_cast<uint8_t>(FrameType::Metadata);
     header.timestamp = 0;
     header.metadataLength = static_cast<uint16_t>(totalLen);
     header.dataLength = totalLen;
-    
-    // Temporarily make blocking
-    int flags = fcntl(socketFd_, F_GETFL, 0);
-    fcntl(socketFd_, F_SETFL, flags & ~O_NONBLOCK);
-    
-    ssize_t s1 = send(socketFd_, &header, sizeof(header), MSG_NOSIGNAL);
-    
-    std::vector<char> buf(totalLen);
-    memcpy(buf.data(), xml, len);
-    buf[len] = 0;
-    
-    ssize_t s2 = send(socketFd_, buf.data(), totalLen, MSG_NOSIGNAL);
-    
-    // Restore non-blocking
-    fcntl(socketFd_, F_SETFL, flags | O_NONBLOCK);
-    
-    return (s1 > 0 && s2 == totalLen);
+
+    // Build the whole frame and send it under sendMutex_ so metadata can
+    // never interleave with a video frame the sender thread is writing.
+    std::vector<uint8_t> buf(sizeof(header) + totalLen);
+    memcpy(buf.data(), &header, sizeof(header));
+    memcpy(buf.data() + sizeof(header), xml, len);
+    buf[sizeof(header) + len] = 0;
+
+    return sendAllBlocking(buf.data(), buf.size());
 }
 
 int Channel::sendAsync(const void* headerData, size_t headerLen,
@@ -184,10 +182,23 @@ int Channel::sendAsync(const void* headerData, size_t headerLen,
     
     AsyncBuffer* buf = sendPool_->acquire();
     if (!buf) {
+        // Pool exhausted (network can't keep up): drop the OLDEST queued
+        // frame and reuse its buffer, so the receiver always gets the
+        // freshest video instead of a growing backlog of stale frames.
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        if (!pendingQueue_.empty()) {
+            buf = pendingQueue_.front();
+            pendingQueue_.pop();
+            framesDropped_++;
+            recentDropped_++;
+        }
+    }
+    if (!buf) {
         framesDropped_++;
+        recentDropped_++;
         static int dropLog = 0;
         if (dropLog++ % 30 == 0) {
-            LOGD("sendAsync: pool exhausted (dropped: %lld)", 
+            LOGD("sendAsync: pool exhausted (dropped: %lld)",
                  (long long)framesDropped_.load());
         }
         return 0;
@@ -247,35 +258,36 @@ void Channel::senderLoop() {
 }
 
 bool Channel::sendAllBlocking(const uint8_t* data, size_t length) {
-    // Make blocking for this call
-    int flags = fcntl(socketFd_, F_GETFL, 0);
-    fcntl(socketFd_, F_SETFL, flags & ~O_NONBLOCK);
-    
+    // Serialize all writers (video sender thread, metadata senders) so
+    // frames never interleave on the wire.
+    std::lock_guard<std::mutex> lock(sendMutex_);
+
     size_t remaining = length;
     const uint8_t* ptr = data;
-    
+
     while (remaining > 0 && connected_) {
         ssize_t sent = send(socketFd_, ptr, remaining, MSG_NOSIGNAL);
-        
+
         if (sent > 0) {
             ptr += sent;
             remaining -= sent;
         } else if (sent < 0) {
             if (errno == EINTR) continue;
-            
-            LOGE("sendAllBlocking: error %d (%s)", errno, strerror(errno));
+
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // SO_SNDTIMEO expired without progress: receiver stalled
+                LOGE("sendAllBlocking: send timed out, dropping stalled receiver");
+            } else {
+                LOGE("sendAllBlocking: error %d (%s)", errno, strerror(errno));
+            }
             connected_ = false;
-            
-            fcntl(socketFd_, F_SETFL, flags | O_NONBLOCK);
             return false;
         } else {
             connected_ = false;
-            fcntl(socketFd_, F_SETFL, flags | O_NONBLOCK);
             return false;
         }
     }
-    
-    fcntl(socketFd_, F_SETFL, flags | O_NONBLOCK);
+
     return remaining == 0;
 }
 
@@ -301,7 +313,17 @@ void Channel::receiverLoop() {
         }
         
         if (sel == 0) continue;
-        
+
+        if (bufferPos >= recvBuffer.size()) {
+            // Buffer full without a complete frame (grown below when a
+            // frame announces its size) - should not happen, but never
+            // call recv() with length 0: it returns 0 and would be
+            // misread as a disconnect.
+            LOGE("receiverLoop: receive buffer full, disconnecting");
+            connected_ = false;
+            break;
+        }
+
         ssize_t received = recv(socketFd_, recvBuffer.data() + bufferPos,
                                 recvBuffer.size() - bufferPos, 0);
         
@@ -327,21 +349,39 @@ void Channel::receiverLoop() {
                 connected_ = false;
                 break;
             }
-            
-            size_t totalFrameLen = FrameHeader::SIZE + header->dataLength;
-            
+
+            // Receivers only send small metadata frames; a huge or negative
+            // length means the stream is desynced - disconnect rather than
+            // spinning forever.
+            if (header->dataLength < 0 ||
+                header->dataLength > Constants::METADATA_FRAME_SIZE) {
+                LOGE("receiverLoop: bad dataLength %d", header->dataLength);
+                connected_ = false;
+                break;
+            }
+
+            uint8_t frameType = header->frameType;
+            int32_t dataLength = header->dataLength;
+            size_t totalFrameLen = FrameHeader::SIZE + dataLength;
+
+            if (totalFrameLen > recvBuffer.size()) {
+                // Grow to fit the announced frame (header pointer is
+                // invalidated by this - fields were copied above).
+                recvBuffer.resize(totalFrameLen);
+            }
+
             if (totalFrameLen > bufferPos) break;
-            
+
             // Process metadata
-            if (header->frameType == static_cast<uint8_t>(FrameType::Metadata) && 
-                header->dataLength > 0) {
+            if (frameType == static_cast<uint8_t>(FrameType::Metadata) &&
+                dataLength > 0) {
                 char* xmlData = reinterpret_cast<char*>(recvBuffer.data() + FrameHeader::SIZE);
-                
+
                 // Fix for conflicting implementations:
                 // - C# libomtnet sends XML *without* null terminator
                 // - Protocol says null terminated
                 // - C++ sender sends *with* null terminator
-                size_t strLen = header->dataLength;
+                size_t strLen = dataLength;
                 if (strLen > 0 && xmlData[strLen - 1] == '\0') {
                     strLen--;
                 }

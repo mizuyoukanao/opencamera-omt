@@ -120,15 +120,14 @@ void Sender::acceptLoop() {
         inet_ntop(AF_INET, &clientAddr.sin_addr, clientIP, sizeof(clientIP));
         LOGI("New connection from %s:%d", clientIP, ntohs(clientAddr.sin_port));
         
-        // Get current optimal buffer size
-        int bufferSize = config_.sendBufferSize;
-        {
-            std::lock_guard<std::mutex> lock(encoderMutex_);
-            if (currentWidth_ > 0 && currentHeight_ > 0) {
-                bufferSize = calculateOptimalBuffer(currentWidth_, currentHeight_, currentProfile_);
-            }
-        }
-        
+        // Use a large fixed send buffer. Setting SO_SNDBUF disables kernel
+        // auto-tuning, so a small value hard-caps TCP throughput at
+        // roughly bufferSize/RTT - on Wi-Fi (RTT 20-100ms) a 64KB buffer
+        // caps out below the video bitrate and causes constant frame
+        // drops. This must not depend on whether the encoder exists yet:
+        // receivers typically connect BEFORE streaming starts.
+        int bufferSize = 2 * 1024 * 1024;
+
         auto channel = std::make_unique<Channel>(clientFd, clientAddr, bufferSize, this);
         
         // Send configured sender info immediately
@@ -466,12 +465,31 @@ void Sender::setSenderInfo(const std::string& productName, const std::string& ma
     sendMetadata(config_.senderInfoXml);
 }
 
+int64_t Sender::getAndResetRecentDrops() {
+    int64_t total = 0;
+    std::lock_guard<std::mutex> lock(channelsMutex_);
+    for (const auto& ch : channels_) {
+        total += ch->getAndResetRecentDrops();
+    }
+    return total;
+}
+
 void Sender::checkCongestion() {
     SenderStats stats = getStats();
-    if (stats.totalFramesSent < 30) return; // Too early
 
-    double dropRate = (double)stats.totalFramesDropped / (double)(stats.totalFramesSent + stats.totalFramesDropped);
-    
+    // Use the drop rate of the recent window only. The cumulative rate
+    // never recovers after one bad period, which caused permanent
+    // downgrades (and stats can shrink when channels disconnect).
+    int64_t sentDelta = stats.totalFramesSent - lastCongestionSent_;
+    int64_t droppedDelta = stats.totalFramesDropped - lastCongestionDropped_;
+    lastCongestionSent_ = stats.totalFramesSent;
+    lastCongestionDropped_ = stats.totalFramesDropped;
+
+    if (sentDelta < 0 || droppedDelta < 0) return; // channel churn, skip window
+    if (sentDelta + droppedDelta < 30) return;     // too few samples
+
+    double dropRate = (double)droppedDelta / (double)(sentDelta + droppedDelta);
+
     if (dropRate > 0.05) { // > 5% drops
         LOGW("High drop rate detected: %.2f%%", dropRate * 100.0);
         

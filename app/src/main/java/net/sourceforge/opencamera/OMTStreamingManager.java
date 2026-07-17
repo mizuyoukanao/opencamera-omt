@@ -347,20 +347,25 @@ public class OMTStreamingManager {
             return;
         }
 
-        // Get Y and U planes (U plane for NV12 interleaved UV)
+        int width = image.getWidth();
+        int height = image.getHeight();
         Image.Plane yPlane = image.getPlanes()[0];
         Image.Plane uPlane = image.getPlanes()[1];
+        Image.Plane vPlane = image.getPlanes()[2];
 
+        // The native encoder reads the UV plane at offset yStride*height and
+        // with the SAME row stride as the Y plane, so the buffer is always
+        // packed with yStride rows for both planes.
         int yStride = yPlane.getRowStride();
-        int uvStride = uPlane.getRowStride();
-        int ySize = yStride * image.getHeight();
-        int uvSize = uvStride * (image.getHeight() / 2);
+        int ySize = yStride * height;
+        int uvSize = yStride * (height / 2);
         int totalSize = ySize + uvSize;
 
         sentFrameCount++;
         if (DEBUG_LOGS && sentFrameCount % 30 == 1) {
-            Log.d(TAG, "sendFrame #" + sentFrameCount + ": " + image.getWidth() + "x" + image.getHeight() +
-                    ", yStride=" + yStride + ", uvStride=" + uvStride + ", totalSize=" + totalSize);
+            Log.d(TAG, "sendFrame #" + sentFrameCount + ": " + width + "x" + height +
+                    ", yStride=" + yStride + ", uvPixelStride=" + uPlane.getPixelStride() +
+                    ", totalSize=" + totalSize);
         }
 
         // Allocate or resize frame buffer if needed
@@ -369,21 +374,98 @@ public class OMTStreamingManager {
             Log.d(TAG, "Allocated frame buffer: " + totalSize + " bytes");
         }
 
-        // Copy Y and UV planes into the frame buffer
         frameBuffer.clear();
 
+        // Y plane. Note the plane buffer may end at yStride*(height-1)+width
+        // (the last row is not padded), i.e. short of ySize.
         ByteBuffer yBuffer = yPlane.getBuffer();
         yBuffer.rewind();
+        if (yBuffer.remaining() > ySize) {
+            yBuffer.limit(ySize);
+        }
         frameBuffer.put(yBuffer);
 
+        // UV must start exactly at yStride*height, regardless of where the Y
+        // copy ended (row padding).
+        frameBuffer.position(ySize);
+
+        int uvPixelStride = uPlane.getPixelStride();
+        int uvRowStride = uPlane.getRowStride();
+        if (uvPixelStride == 2 && uvRowStride == yStride) {
+            // Fast path: chroma is already NV12-style interleaved UV with the
+            // expected stride - bulk copy.
+            ByteBuffer uBuffer = uPlane.getBuffer();
+            uBuffer.rewind();
+            if (uBuffer.remaining() > uvSize) {
+                uBuffer.limit(uvSize);
+            }
+            frameBuffer.put(uBuffer);
+        } else {
+            // Slow path: planar chroma (pixelStride 1) or a chroma row stride
+            // that differs from the luma stride - repack row by row.
+            repackUV(uPlane, vPlane, width, height, yStride, ySize);
+        }
+
+        frameBuffer.position(0);
+        frameBuffer.limit(totalSize);
+
+        // Send to OMT (buffer is packed with yStride for both planes)
+        omtSender.sendFrame(frameBuffer, width, height, yStride, yStride);
+    }
+
+    // Reusable scratch rows for repackUV (single-threaded: OMT handler thread)
+    private byte[] uvInterleavedRow;
+    private byte[] uScratchRow;
+    private byte[] vScratchRow;
+
+    /**
+     * Rebuild the interleaved NV12 UV plane row by row into frameBuffer at
+     * offset ySize, using yStride as the destination row stride.
+     */
+    private void repackUV(Image.Plane uPlane, Image.Plane vPlane,
+                          int width, int height, int yStride, int ySize) {
+        int chromaWidth = width / 2;
+        int chromaHeight = height / 2;
+        int rowBytes = chromaWidth * 2;
+
+        int uvPixelStride = uPlane.getPixelStride();
+        int uRowStride = uPlane.getRowStride();
+        int vRowStride = vPlane.getRowStride();
+
         ByteBuffer uBuffer = uPlane.getBuffer();
-        uBuffer.rewind();
-        frameBuffer.put(uBuffer);
+        ByteBuffer vBuffer = vPlane.getBuffer();
 
-        frameBuffer.flip();
+        if (uvInterleavedRow == null || uvInterleavedRow.length < rowBytes) {
+            uvInterleavedRow = new byte[rowBytes];
+            uScratchRow = new byte[rowBytes];
+            vScratchRow = new byte[rowBytes];
+        }
 
-        // Send to OMT
-        omtSender.sendFrame(frameBuffer, image.getWidth(), image.getHeight(), yStride, uvStride);
+        for (int r = 0; r < chromaHeight; r++) {
+            int dstPos = ySize + r * yStride;
+            if (uvPixelStride == 2) {
+                // Interleaved UV but with an unexpected row stride: copy each
+                // row (the final row may be one byte short of rowBytes).
+                int srcPos = r * uRowStride;
+                int len = Math.min(rowBytes, uBuffer.capacity() - srcPos);
+                uBuffer.position(srcPos);
+                uBuffer.get(uvInterleavedRow, 0, len);
+                frameBuffer.position(dstPos);
+                frameBuffer.put(uvInterleavedRow, 0, len);
+            } else {
+                // Planar U and V: interleave manually
+                uBuffer.position(r * uRowStride);
+                uBuffer.get(uScratchRow, 0, chromaWidth);
+                vBuffer.position(r * vRowStride);
+                vBuffer.get(vScratchRow, 0, chromaWidth);
+                for (int i = 0; i < chromaWidth; i++) {
+                    uvInterleavedRow[2 * i] = uScratchRow[i];
+                    uvInterleavedRow[2 * i + 1] = vScratchRow[i];
+                }
+                frameBuffer.position(dstPos);
+                frameBuffer.put(uvInterleavedRow, 0, rowBytes);
+            }
+        }
     }
 
     private void startBackgroundThread() {
